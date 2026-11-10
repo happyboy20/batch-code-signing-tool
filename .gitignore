@@ -1,0 +1,13 @@
+bin/
+obj/
+配布用/
+単一EXE/
+*.user
+*.suo
+UI-preview*.png
+
+settings.json
+*.pfx
+*.p12
+.env
+.env.*
