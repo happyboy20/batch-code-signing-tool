@@ -15,3 +15,9 @@
 ## .NET・Windows
 
 .NET 10 Desktop Runtimeは本体に同梱しません。Microsoftの提供元から別途導入し、その利用条件に従ってください。Windows標準の署名検査APIを使用します。
+
+## Microsoft SignTool・USBドライバー
+
+USB方式では、[Windows SDK](https://developer.microsoft.com/windows/downloads/windows-sdk/) に含まれるMicrosoft SignToolを外部プロセスとして使用します。SignToolやSDKのファイルは同梱・再配布しません。Microsoft公式から導入し、Microsoftの利用条件に従ってください。
+
+トークンのドライバー・管理ソフトも同梱しません。各メーカーまたは証明書販売元の公式案内に従って導入してください。本ツールは秘密鍵をエクスポートせず、PINを保存しません。

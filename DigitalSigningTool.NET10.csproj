@@ -9,6 +9,8 @@
     <EnableDefaultCompileItems>false</EnableDefaultCompileItems>
     <AssemblyName>DigitalSigningTool.NET10</AssemblyName>
     <Product>デジタル署名ツール</Product>
+    <Version>1.1.0</Version>
+    <Copyright>Copyright © 2026 rc9g6dp62z-arch</Copyright>
     <Title>デジタル署名ツール</Title>
     <ApplicationIcon>Images\app.ico</ApplicationIcon>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
