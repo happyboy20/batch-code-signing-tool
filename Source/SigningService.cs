@@ -36,6 +36,7 @@ internal sealed record ProcessOutput(int Code, string StandardOutput, string Sta
 }
 public sealed class SignatureInfo
 {
+    public string Thumbprint { get; set; } = "";
     public string Status { get; set; } = "";
     public string Publisher { get; set; } = "";
     public bool HasCertificate { get; set; }
@@ -128,8 +129,22 @@ public static class SigningService
     //*<説明> 本番用の署名状態取得とコマンド実行を組み合わせます。
     //***************************************************************************
     public static async Task<FileResult> SignAsync(string path, SigningSettings settings, string secret, CancellationToken cancellationToken = default)
-        => await SignCoreAsync(path, settings, secret, p => InspectAsync(p, cancellationToken),
+    {
+        // USBは実行直前にも公開証明書を確認する。秘密鍵は取り出さず、PINはドライバーに任せる。
+        if (settings.UseUsbToken)
+        {
+            try
+            {
+                cancellationToken.ThrowIfCancellationRequested();
+                if (settings.IsExpired(DateTime.Today)) return new(path, "失敗", "利用期限を過ぎたため処理しませんでした。設定を更新してください。");
+                UsbSigning.ValidateCertificate(settings);
+            }
+            catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested) { return new(path, "中止", "署名を開始する前に中止しました。"); }
+            catch (Exception ex) { return new(path, "失敗", ErrorDetails.Format(ex, typeof(SigningService), nameof(SignAsync))); }
+        }
+        return await SignCoreAsync(path, settings, secret, p => InspectAsync(p, cancellationToken),
             (s, key, p) => RunSignerAsync(s, key, p, cancellationToken), DateTime.Today, cancellationToken);
+    }
 
     // SHA-256・タイムスタンプ付き署名の実行
     //***************************************************************************
@@ -141,13 +156,32 @@ public static class SigningService
     //***************************************************************************
     private static async Task<(int Code, string Output)> RunSignerAsync(SigningSettings settings, string secret, string path, CancellationToken cancellationToken)
     {
-        var result = await ExecuteAsync(settings.ToolPath,
+        // USBではMicrosoft SignToolと完全一致の拇印を使う。PINやAzure情報は引数へ渡さない。
+        var result = await ExecuteAsync(settings.ActiveToolPath, BuildSignerArguments(settings, secret, path), cancellationToken: cancellationToken);
+        return (result.Code, result.Combined);
+    }
+
+    // 署名方式別の引数作成
+    //***************************************************************************
+    //*<引数> settings : 設定 / secret : Azure認証情報 / path : 対象パス
+    //*<返値> シェル解釈を使用しない独立した引数一覧
+    //*<説明> USBはストアと拇印を固定し、SHA-256とRFC 3161のタイムスタンプを要求します。
+    //***************************************************************************
+    internal static string[] BuildSignerArguments(SigningSettings settings, string secret, string path)
+    {
+        if (settings.UseUsbToken)
+        {
+            var arguments = new List<string> { "sign", "/s", "My" };
+            if (settings.UsbLocalMachine) arguments.Add("/sm");
+            arguments.AddRange(["/sha1", UsbSigning.NormalizeThumbprint(settings.UsbThumbprint), "/fd", "SHA256", "/tr", settings.TimestampUrl, "/td", "SHA256", Path.GetFullPath(path)]);
+            return arguments.ToArray();
+        }
+        return
         [
             "sign", "-kvu", settings.VaultUrl, "-kvc", settings.CertificateName,
             "-kvi", settings.ClientId, "-kvt", settings.TenantId, "-kvs", secret,
             "-tr", settings.TimestampUrl, "-td", "sha256", "-fd", "sha256", path
-        ], cancellationToken: cancellationToken);
-        return (result.Code, result.Combined);
+        ];
     }
 
     // 署名前後の検査と結果判定
@@ -169,18 +203,20 @@ public static class SigningService
             cancellationToken.ThrowIfCancellationRequested();
             if (settings.IsExpired(today)) return new(path, "失敗", "利用期限を過ぎたため処理しませんでした。設定を更新してください。");
             SettingsValidation.ValidateConnection(settings);
-            if (string.IsNullOrWhiteSpace(secret)) throw new ArgumentException("クライアントシークレットが未設定です。");
+            if (!settings.UseUsbToken && string.IsNullOrWhiteSpace(secret)) throw new ArgumentException("クライアントシークレットが未設定です。");
             if (!File.Exists(path)) throw new FileNotFoundException("対象ファイルが見つかりません。", path);
             var before = await inspect(path);
             cancellationToken.ThrowIfCancellationRequested();
             if (before.HasCertificate && string.IsNullOrWhiteSpace(before.Publisher))
                 return new(path, "失敗", "既存署名の発行元を特定できないため変更しませんでした。");
-            if (before.HasCertificate && !string.Equals(before.Publisher, settings.PublisherName, StringComparison.OrdinalIgnoreCase))
+            if (before.HasCertificate && !string.Equals(before.Publisher, settings.ActivePublisherName, StringComparison.OrdinalIgnoreCase))
                 return new(path, "スキップ", $"他社署名を保持：{before.Publisher}（{before.Status}）");
             if (!before.HasCertificate && before.Status != "NotSigned")
                 return new(path, "失敗", $"署名状態が不明なため変更しませんでした：{before.Status}");
 
-            if (!File.Exists(settings.ToolPath)) throw new FileNotFoundException("AzureSignToolが見つかりません。自動セットアップを実行してください。");
+            if (!File.Exists(settings.ActiveToolPath)) throw new FileNotFoundException(settings.UseUsbToken
+                ? "Microsoft SignToolが見つかりません。Windows SDKを導入して場所を設定してください。"
+                : "AzureSignToolが見つかりません。自動セットアップを実行してください。");
             if ((File.GetAttributes(path) & FileAttributes.ReadOnly) != 0) throw new IOException("対象ファイルは読み取り専用です。");
             // 内容を書き換えず、書込権限と使用中ロックを事前確認する。
             using (new FileStream(path, FileMode.Open, FileAccess.ReadWrite, FileShare.Read)) { }
@@ -192,8 +228,9 @@ public static class SigningService
                 return new(path, "失敗", $"署名コマンド終了コード：{result.Code}\n{Clean(result.Output, secret)}\nファイルは変更されている可能性があります。");
             var after = await inspect(path);
             cancellationToken.ThrowIfCancellationRequested();
-            if (after.Status != "Valid" || !after.HasTimestamp || !string.Equals(after.Publisher, settings.PublisherName, StringComparison.OrdinalIgnoreCase))
-                return new(path, "失敗", $"署名後の検証に失敗：状態={after.Status}、発行元={after.Publisher}、タイムスタンプ={(after.HasTimestamp ? "あり" : "なし")}。ファイルは変更されている可能性があります。");
+            if (after.Status != "Valid" || !after.HasTimestamp || !string.Equals(after.Publisher, settings.ActivePublisherName, StringComparison.OrdinalIgnoreCase)
+                || (settings.UseUsbToken && !string.Equals(after.Thumbprint, UsbSigning.NormalizeThumbprint(settings.UsbThumbprint), StringComparison.OrdinalIgnoreCase)))
+                return new(path, "失敗", $"署名後の検証に失敗：状態={after.Status}、発行元={after.Publisher}、タイムスタンプ={(after.HasTimestamp ? "あり" : "なし")}。{(settings.UseUsbToken ? "USBでは選択した証明書の拇印一致も必要です。" : "")}ファイルは変更されている可能性があります。");
             return new(path, "成功", "自社署名とタイムスタンプを確認しました。");
         }
         catch (OperationCanceledException) when (cancellationToken.IsCancellationRequested)
@@ -221,6 +258,94 @@ public static class SigningService
     private static string Clean(string text, string secret)
     {
         return ErrorDetails.Redact(text.Trim(), secret);
+    }
+}
+
+#endregion
+
+#region USBトークン・Microsoft SignTool
+
+internal sealed record UsbCertificate(string Thumbprint, string Publisher, string Subject, DateTime Expires)
+{
+    public override string ToString() => $"{Publisher} ｜ {Expires:yyyy/MM/dd} ｜ {Thumbprint}";
+}
+
+internal static class UsbSigning
+{
+    // 拇印の正規化
+    //***************************************************************************
+    //*<引数> value : 証明書画面からコピーした拇印
+    //*<返値> 空白と表示方向制御文字を除いた大文字の拇印
+    //*<説明> ハイフン等の不正文字は残し、入力検査で拒否します。
+    //***************************************************************************
+    internal static string NormalizeThumbprint(string value) => new(value.Where(c => !char.IsWhiteSpace(c) && c is not '\u200e' and not '\u200f').Select(char.ToUpperInvariant).ToArray());
+
+    // コード署名用証明書の条件確認
+    //***************************************************************************
+    //*<引数> certificate : Windowsストア内の証明書 / now : 判定時刻
+    //*<返値> 秘密鍵への関連付け・有効期間・コード署名用途がある場合true
+    //*<説明> 秘密鍵を取得せず公開情報のみ検査します。USBの接続やPINの正否は実署名で確認されます。
+    //***************************************************************************
+    internal static bool IsSigningCertificate(X509Certificate2 certificate, DateTime now) =>
+        certificate.HasPrivateKey && now >= certificate.NotBefore && now <= certificate.NotAfter &&
+        certificate.Extensions.OfType<X509KeyUsageExtension>().All(extension => (extension.KeyUsages & X509KeyUsageFlags.DigitalSignature) != 0) &&
+        certificate.Extensions.OfType<X509EnhancedKeyUsageExtension>().Any(extension =>
+            extension.EnhancedKeyUsages.Cast<Oid>().Any(oid => oid.Value == "1.3.6.1.5.5.7.3.3"));
+
+    // 選択候補の読込
+    //***************************************************************************
+    //*<引数> localMachine : ローカルコンピューターのストアか
+    //*<返値> 有効なコード署名証明書の公開情報一覧
+    //*<説明> Myストアを読取専用で開きます。候補にはソフトウェア鍵も含むため、USB管理画面との照合が必要です。
+    //***************************************************************************
+    internal static UsbCertificate[] ReadCertificates(bool localMachine)
+    {
+        using var store = new X509Store(StoreName.My, localMachine ? StoreLocation.LocalMachine : StoreLocation.CurrentUser);
+        store.Open(OpenFlags.ReadOnly | OpenFlags.OpenExistingOnly);
+        var choices = new List<UsbCertificate>();
+        foreach (var certificate in store.Certificates)
+        {
+            using (certificate)
+                if (IsSigningCertificate(certificate, DateTime.Now))
+                    choices.Add(new(certificate.Thumbprint, certificate.GetNameInfo(X509NameType.SimpleName, false), certificate.Subject, certificate.NotAfter));
+        }
+        return choices.OrderBy(item => item.Publisher).ThenByDescending(item => item.Expires).ToArray();
+    }
+
+    // 選択証明書の再確認
+    //***************************************************************************
+    //*<引数> settings : USB方式の設定
+    //*<返値> なし（未検出・用途不正・発行元不一致の場合は例外）
+    //*<説明> 保存時と実行前にストアの拇印を完全一致で確認します。秘密鍵やPINには触れません。
+    //***************************************************************************
+    internal static void ValidateCertificate(SigningSettings settings)
+    {
+        SettingsValidation.ValidateConnection(settings);
+        var thumbprint = NormalizeThumbprint(settings.UsbThumbprint);
+        var certificate = ReadCertificates(settings.UsbLocalMachine).SingleOrDefault(item => item.Thumbprint.Equals(thumbprint, StringComparison.OrdinalIgnoreCase));
+        if (certificate is null) throw new ArgumentException("選択した有効なコード署名証明書が見つかりません。USBトークン・ドライバー・ストアの場所・有効期間を確認してください。");
+        if (!certificate.Publisher.Equals(settings.ActivePublisherName, StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("USB証明書の発行元名が設定と一致しません。「証明書を読込」から選び直してください。");
+    }
+
+    // 導入済みSignToolの検索
+    //***************************************************************************
+    //*<引数> configured : 現在のパス
+    //*<返値> 設定済み、または最新のWindows SDK x64版のパス。未検出なら元の値
+    //*<説明> 既知のSDK配置先だけを参照します。ダウンロードや起動は行いません。
+    //***************************************************************************
+    internal static string FindSignTool(string configured)
+    {
+        if (File.Exists(configured)) return configured;
+        try
+        {
+            var root = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFilesX86), "Windows Kits", "10", "bin");
+            if (!Directory.Exists(root)) return configured;
+            var versions = Directory.EnumerateDirectories(root).Select(path => (Path: path, Version: Version.TryParse(Path.GetFileName(path), out var version) ? version : new Version(0, 0)));
+            return versions.OrderByDescending(item => item.Version).Select(item => Path.Combine(item.Path, "x64", "signtool.exe")).FirstOrDefault(File.Exists) ?? configured;
+        }
+        // 自動検出先の読取障害で設定画面を開けなくしない。保存時に実在を再確認する。
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException) { return configured; }
     }
 }
 
@@ -327,6 +452,7 @@ internal static class NativeSignature
                         {
                             using var cert = new X509Certificate2(context);
                             info.HasCertificate = true;
+                            info.Thumbprint = cert.Thumbprint;
                             info.Publisher = cert.GetNameInfo(X509NameType.SimpleName, false);
                         }
                     }

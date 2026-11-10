@@ -364,7 +364,9 @@ public sealed class MainForm : Form
     //*-------------------------------------------------------------------------
     //*<説明> 現在の利用期間と証明書名を表示します。
     //***************************************************************************
-    private void UpdatePeriod() => period.Text = (settings.LimitUsagePeriod ? $"利用期間 {settings.StartDate:yyyy/MM/dd} ～ {settings.EndDate:yyyy/MM/dd}" : "利用期間の制限なし") + "　｜　証明書 " + (string.IsNullOrWhiteSpace(settings.CertificateName) ? "未設定" : settings.CertificateName);
+    private void UpdatePeriod() => period.Text = (settings.LimitUsagePeriod ? $"利用期間 {settings.StartDate:yyyy/MM/dd} ～ {settings.EndDate:yyyy/MM/dd}" : "利用期間の制限なし")
+        + (settings.UseUsbToken ? "　｜　USBトークン：" + (string.IsNullOrWhiteSpace(settings.UsbThumbprint) ? "未設定" : settings.UsbPublisherName)
+        : "　｜　Azure：" + (string.IsNullOrWhiteSpace(settings.CertificateName) ? "未設定" : settings.CertificateName));
 
     // 設定画面の表示
     //***************************************************************************
@@ -405,8 +407,12 @@ public sealed class MainForm : Form
         try
         {
             SettingsValidation.ValidateConnection(settings);
-            if (!File.Exists(settings.ToolPath)) throw new FileNotFoundException("AzureSignToolが見つかりません。設定画面の自動セットアップを使用してください。");
-            secret = SecretProtection.Unprotect(settings.ProtectedSecret);
+            if (!File.Exists(settings.ActiveToolPath)) throw new FileNotFoundException(settings.UseUsbToken
+                ? "SignToolが見つかりません。設定画面でWindows SDKの場所を指定してください。"
+                : "AzureSignToolが見つかりません。設定画面の自動セットアップを使用してください。");
+            // USBではAzure認証情報を復号せず、証明書の公開情報だけを確認する。
+            if (settings.UseUsbToken) UsbSigning.ValidateCertificate(settings);
+            secret = settings.UseUsbToken ? "" : SecretProtection.Unprotect(settings.ProtectedSecret);
         }
         catch (Exception ex) { ShowError(ex, "署名前の設定確認"); EditSettings(); return; }
         using var cancellation = new CancellationTokenSource();

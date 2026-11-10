@@ -35,6 +35,17 @@ public sealed class SettingsForm : Form
     private readonly TextBox tool = new();
     private readonly TextBox timestamp = new();
     private readonly TextBox publisher = new();
+    private readonly ComboBox mode = new() { Name = "SigningMode", DropDownStyle = ComboBoxStyle.DropDownList };
+    private readonly ComboBox usbStore = new() { Name = "UsbStore", DropDownStyle = ComboBoxStyle.DropDownList };
+    private readonly ComboBox tokenCertificates = new() { Name = "UsbCertificates", DropDownStyle = ComboBoxStyle.DropDownList, DropDownWidth = 850 };
+    private readonly TextBox usbTool = new() { Name = "SignToolPath" };
+    private readonly TextBox thumbprint = new() { Name = "UsbThumbprint" };
+    private readonly TextBox usbPublisher = new() { Name = "UsbPublisherName" };
+    private Control[] azureRows = [];
+    private Control[] usbRows = [];
+    private readonly Label tokenNotice = new() { AutoSize = true, MaximumSize = new Size(570, 0), Text = "USBの公式ドライバーとWindows SDKが必要です。PINはドライバーの画面で入力します。" };
+    private Button loadCertificates = null!;
+    private Button browseSignTool = null!;
     private readonly Label notice = new() { AutoSize = true, MaximumSize = new Size(680, 0), Margin = new Padding(8) };
 
     #endregion
@@ -57,7 +68,7 @@ public sealed class SettingsForm : Form
         UiTheme.Apply(this, "設定 - デジタル署名ツール");
         Settings = settings.Copy();
         StartPosition = FormStartPosition.CenterParent;
-        Size = new Size(940, 820); MinimumSize = new Size(900, 680);
+        Size = new Size(980, 900); MinimumSize = new Size(900, 680);
         var layout = new TableLayoutPanel { Dock = DockStyle.Fill, BackColor = UiTheme.Background, Padding = new Padding(24), ColumnCount = 1, RowCount = 3 };
         layout.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         layout.RowStyles.Add(new RowStyle(SizeType.AutoSize));
@@ -75,6 +86,11 @@ public sealed class SettingsForm : Form
         fields.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 190));
         fields.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
         card.Controls.Add(fields); layout.Controls.Add(card, 0, 1);
+        mode.Items.AddRange(["Azure Key Vault", "USBトークン（Microsoft SignTool）"]);
+        usbStore.Items.AddRange(["現在のユーザー：個人（My）", "ローカルコンピューター：個人（My）"]);
+        mode.SelectedIndex = Settings.UseUsbToken ? 1 : 0;
+        usbStore.SelectedIndex = Settings.UsbLocalMachine ? 1 : 0;
+        AddRow(fields, "署名方式", mode);
         var next = new Button { Name = "RenewPeriod", Text = "次期へ更新", AutoSize = true };
         UiTheme.StyleButton(next);
         AddSection(fields, "利用期間・証明書", next);
@@ -86,7 +102,7 @@ public sealed class SettingsForm : Form
         {
             try
             {
-                var draft = Settings.Copy();
+                var draft = Settings.Copy(); draft.UseUsbToken = mode.SelectedIndex == 1;
                 draft.StartDate = start.Value.Date; draft.EndDate = end.Value.Date; draft.CertificateName = certificate.Text.Trim();
                 var previousName = draft.CertificateName;
                 draft.AdvanceYear();
@@ -98,6 +114,8 @@ public sealed class SettingsForm : Form
         foreach (var picker in new[] { start, end }) { picker.Format = DateTimePickerFormat.Custom; picker.CustomFormat = "yyyy/MM/dd"; picker.MaximumSize = new Size(210, 0); }
         AddRow(fields, "利用開始日", start);
         AddRow(fields, "利用終了日（当日まで）", end);
+        AddRow(fields, "タイムスタンプURL", timestamp);
+        var azureFirstRow = fields.RowCount;
         AddRow(fields, "証明書名", certificate);
         AddSection(fields, "接続情報");
         AddRow(fields, "Key Vault URL", vault);
@@ -105,7 +123,6 @@ public sealed class SettingsForm : Form
         AddRow(fields, "テナントID", tenant);
         AddRow(fields, "クライアントシークレット", secret);
         AddRow(fields, "自社証明書の発行元名", publisher);
-        AddRow(fields, "タイムスタンプURL", timestamp);
         AddSection(fields, "署名ツール");
         var toolPicker = new TableLayoutPanel { AutoSize = true, ColumnCount = 3, Margin = Padding.Empty };
         toolPicker.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
@@ -127,6 +144,58 @@ public sealed class SettingsForm : Form
         };
         setupTool.Click += (_, _) => ShowInstallationGuide();
         AddRow(fields, "AzureSignToolの場所", toolPicker);
+        var usbFirstRow = fields.RowCount;
+        AddSection(fields, "USBトークン");
+        AddRow(fields, "証明書ストア", usbStore);
+        loadCertificates = new Button { Name = "LoadUsbCertificates", Text = "証明書を読込", AutoSize = true };
+        UiTheme.StyleButton(loadCertificates);
+        var certificatePicker = new TableLayoutPanel { AutoSize = true, ColumnCount = 2, Margin = Padding.Empty };
+        certificatePicker.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100)); certificatePicker.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        tokenCertificates.Dock = DockStyle.Fill;
+        certificatePicker.Controls.Add(tokenCertificates, 0, 0); certificatePicker.Controls.Add(loadCertificates, 1, 0);
+        loadCertificates.Click += (_, _) => LoadUsbCertificates();
+        tokenCertificates.SelectedIndexChanged += (_, _) =>
+        {
+            if (tokenCertificates.SelectedItem is UsbCertificate selected) { thumbprint.Text = selected.Thumbprint; usbPublisher.Text = selected.Publisher; }
+        };
+        usbStore.SelectedIndexChanged += (_, _) => { tokenCertificates.Items.Clear(); thumbprint.Clear(); tokenNotice.Text = "ストアを変更しました。「証明書を読込」から選択してください。"; };
+        AddRow(fields, "コード署名証明書", certificatePicker);
+        AddRow(fields, "証明書の拇印", thumbprint);
+        AddRow(fields, "USB証明書の発行元名", usbPublisher);
+        browseSignTool = new Button { Text = "参照…", AutoSize = true };
+        var findSignTool = new Button { Name = "FindSignTool", Text = "自動検出", AutoSize = true };
+        UiTheme.StyleButton(browseSignTool); UiTheme.StyleButton(findSignTool);
+        var signToolPicker = new TableLayoutPanel { AutoSize = true, ColumnCount = 3, Margin = Padding.Empty };
+        signToolPicker.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 100));
+        signToolPicker.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize)); signToolPicker.ColumnStyles.Add(new ColumnStyle(SizeType.AutoSize));
+        usbTool.Dock = DockStyle.Fill; usbTool.BorderStyle = BorderStyle.FixedSingle;
+        signToolPicker.Controls.Add(usbTool, 0, 0); signToolPicker.Controls.Add(browseSignTool, 1, 0); signToolPicker.Controls.Add(findSignTool, 2, 0);
+        browseSignTool.Click += (_, _) =>
+        {
+            try
+            {
+                using var dialog = new OpenFileDialog { Title = "Windows SDKのsigntool.exeを選択", Filter = "Microsoft SignTool|signtool.exe", CheckFileExists = true };
+                if (dialog.ShowDialog(this) == DialogResult.OK) usbTool.Text = dialog.FileName;
+            }
+            catch (Exception ex) { ShowError(ex, "SignToolの参照"); }
+        };
+        findSignTool.Click += (_, _) =>
+        {
+            try { usbTool.Text = UsbSigning.FindSignTool(usbTool.Text.Trim().Trim('"')); tokenNotice.Text = File.Exists(usbTool.Text) ? "導入済みのSignToolを確認しました。" : "SignToolが見つかりません。Microsoft公式サイトからWindows SDKを導入してください。"; }
+            catch (Exception ex) { ShowError(ex, "SignToolの検出"); }
+        };
+        AddRow(fields, "Microsoft SignTool", signToolPicker);
+        var getSdk = new LinkLabel { Text = "Windows SDKの公式入手ページ", AutoSize = true, LinkColor = UiTheme.Text };
+        getSdk.LinkClicked += (_, _) =>
+        {
+            try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo("https://developer.microsoft.com/windows/downloads/windows-sdk/") { UseShellExecute = true }); }
+            catch (Exception ex) { ShowError(ex, "Windows SDKの入手ページ"); }
+        };
+        AddRow(fields, "未導入の場合", getSdk);
+        AddRow(fields, "USB利用時の注意", tokenNotice);
+        azureRows = fields.Controls.Cast<Control>().Where(control => fields.GetRow(control) >= azureFirstRow && fields.GetRow(control) < usbFirstRow).ToArray();
+        usbRows = fields.Controls.Cast<Control>().Where(control => fields.GetRow(control) >= usbFirstRow).ToArray();
+        mode.SelectedIndexChanged += (_, _) => ApplySigningMode();
         var buttons = new FlowLayoutPanel { AutoSize = true, Dock = DockStyle.Fill, FlowDirection = FlowDirection.RightToLeft, Margin = new Padding(0, 16, 0, 0) };
         var save = new Button { Name = "SaveSettings", Text = "保存", AutoSize = true };
         var close = new Button { Name = "CloseSettings", Text = "キャンセル", AutoSize = true, DialogResult = DialogResult.Cancel };
@@ -141,7 +210,42 @@ public sealed class SettingsForm : Form
         certificate.Text = Settings.CertificateName; vault.Text = Settings.VaultUrl;
         client.Text = Settings.ClientId; tenant.Text = Settings.TenantId;
         tool.Text = InstallationGuideForm.FindExisting(Settings.ToolPath); timestamp.Text = Settings.TimestampUrl; publisher.Text = Settings.PublisherName;
-        Shown += (_, _) => { if (!File.Exists(tool.Text)) ShowInstallationGuide(); };
+        usbTool.Text = UsbSigning.FindSignTool(Settings.SignToolPath); thumbprint.Text = Settings.UsbThumbprint; usbPublisher.Text = Settings.UsbPublisherName;
+        ApplySigningMode();
+        Shown += (_, _) => { if (mode.SelectedIndex == 0 && !File.Exists(tool.Text)) ShowInstallationGuide(); };
+    }
+
+    // 署名方式の切替
+    //***************************************************************************
+    //*<引数> なし / <返値> なし
+    //*<説明> 使用しない方式の入力を無効化し、保存時も選択中の方式だけを要求します。
+    //***************************************************************************
+    private void ApplySigningMode()
+    {
+        var usb = mode.SelectedIndex == 1;
+        // 選択した方式の項目だけを表示し、保存前の切替でも他方式の入力値を保持する。
+        foreach (var control in azureRows) control.Visible = !usb;
+        foreach (var control in usbRows) control.Visible = usb;
+        foreach (var control in new Control[] { certificate, vault, client, tenant, secret, tool }) control.Enabled = !usb;
+        foreach (var control in new Control[] { usbStore, tokenCertificates, thumbprint, usbTool, loadCertificates, browseSignTool }) control.Enabled = usb;
+    }
+
+    // USB証明書候補の表示
+    //***************************************************************************
+    //*<引数> なし / <返値> なし
+    //*<説明> 公開情報だけを読込し、選択時に拇印と発行元を反映します。自動選択や署名はしません。
+    //***************************************************************************
+    private void LoadUsbCertificates()
+    {
+        try
+        {
+            var choices = UsbSigning.ReadCertificates(usbStore.SelectedIndex == 1);
+            tokenCertificates.Items.Clear(); tokenCertificates.Items.AddRange(choices.Cast<object>().ToArray());
+            tokenNotice.Text = choices.Length == 0 ? "有効なコード署名証明書がありません。USB接続、公式ドライバー、証明書ストアを確認してください。"
+                : "USB管理画面と拇印を照合して選んでください。候補にはUSB以外の鍵も含まれます。PINは保存しません。";
+            tokenCertificates.SelectedIndex = -1;
+        }
+        catch (Exception ex) { ShowError(ex, "USB証明書の読込"); }
     }
 
     // 設定項目の見出し追加
@@ -212,6 +316,11 @@ public sealed class SettingsForm : Form
         try
         {
             var draft = Settings.Copy();
+            draft.UseUsbToken = mode.SelectedIndex == 1;
+            draft.SignToolPath = usbTool.Text.Trim().Trim('"');
+            draft.UsbThumbprint = UsbSigning.NormalizeThumbprint(thumbprint.Text);
+            draft.UsbPublisherName = usbPublisher.Text.Trim();
+            draft.UsbLocalMachine = usbStore.SelectedIndex == 1;
             draft.LimitUsagePeriod = limitPeriod.Checked;
             draft.StartDate = start.Value.Date; draft.EndDate = end.Value.Date;
             draft.CertificateName = certificate.Text.Trim(); draft.VaultUrl = vault.Text.Trim();
@@ -219,16 +328,24 @@ public sealed class SettingsForm : Form
             draft.ToolPath = tool.Text.Trim().Trim('"'); draft.TimestampUrl = timestamp.Text.Trim(); draft.PublisherName = publisher.Text.Trim();
             SettingsValidation.ValidateConnection(draft);
             if (draft.IsExpired(DateTime.Today)) throw new ArgumentException("利用終了日を今日以降に設定してください。");
-            if (!File.Exists(draft.ToolPath))
+            if (draft.UseUsbToken)
+            {
+                if (!File.Exists(draft.SignToolPath)) throw new FileNotFoundException("SignToolが見つかりません。Windows SDKを導入し「自動検出」を押してください。");
+                UsbSigning.ValidateCertificate(draft);
+            }
+            else if (!File.Exists(draft.ToolPath))
             {
                 if (!ShowInstallationGuide()) return;
                 draft.ToolPath = tool.Text.Trim().Trim('"');
                 SettingsValidation.ValidateConnection(draft);
                 if (!File.Exists(draft.ToolPath)) throw new FileNotFoundException("AzureSignToolが見つかりません。");
             }
-            if (!string.IsNullOrEmpty(secret.Text)) draft.ProtectedSecret = SecretProtection.Protect(secret.Text);
-            if (!draft.IsConfigured) throw new ArgumentException("クライアントシークレットを入力してください。");
-            _ = SecretProtection.Unprotect(draft.ProtectedSecret);
+            if (!draft.UseUsbToken)
+            {
+                if (!string.IsNullOrEmpty(secret.Text)) draft.ProtectedSecret = SecretProtection.Protect(secret.Text);
+                if (!draft.IsConfigured) throw new ArgumentException("クライアントシークレットを入力してください。");
+                _ = SecretProtection.Unprotect(draft.ProtectedSecret);
+            }
             SettingsStore.Save(draft); Settings = draft; secret.Clear();
             DialogResult = DialogResult.OK; Close();
         }

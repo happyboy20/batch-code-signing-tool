@@ -27,6 +27,13 @@ namespace DigitalSigningTool;
 
 public sealed class SigningSettings
 {
+    public bool UseUsbToken { get; set; }
+    public string SignToolPath { get; set; } = "";
+    public string UsbThumbprint { get; set; } = "";
+    public string UsbPublisherName { get; set; } = "";
+    public bool UsbLocalMachine { get; set; }
+    public string ActiveToolPath => UseUsbToken ? SignToolPath : ToolPath;
+    public string ActivePublisherName => UseUsbToken ? UsbPublisherName : PublisherName;
     public bool LimitUsagePeriod { get; set; } = false;
     public DateTime StartDate { get; set; } = DateTime.Today;
     public DateTime EndDate { get; set; } = DateTime.Today.AddYears(1);
@@ -48,7 +55,7 @@ public sealed class SigningSettings
     //*<説明> 制限が有効な場合だけ終了日を判定します。終了日当日と開始日前の日付は利用可能です。
     //***************************************************************************
     public bool IsExpired(DateTime today) => LimitUsagePeriod && today.Date > EndDate.Date;
-    public bool IsConfigured => !string.IsNullOrWhiteSpace(ProtectedSecret);
+    public bool IsConfigured => UseUsbToken ? !string.IsNullOrWhiteSpace(UsbThumbprint) : !string.IsNullOrWhiteSpace(ProtectedSecret);
 
     // 証明書名と利用期間の次期更新
     //***************************************************************************
@@ -61,7 +68,8 @@ public sealed class SigningSettings
     public void AdvanceYear()
     {
         SettingsValidation.ValidateStructure(this);
-        var match = Regex.Match(CertificateName, @"^[0-9]{4}");
+        // USBの証明書は拇印で選択するため、Azureの証明書名は変更しない。
+        var match = Regex.Match(UseUsbToken ? "" : CertificateName, @"^[0-9]{4}");
         var nextName = CertificateName;
         if (match.Success)
         {
@@ -69,7 +77,7 @@ public sealed class SigningSettings
             if (year < 1 || year >= 9999) throw new ArgumentException("証明書名の先頭年は0001～9998にしてください。");
             nextName = (year + 1).ToString("D4") + CertificateName[4..];
         }
-        else if (Regex.IsMatch(CertificateName, @"^[０-９]{4}"))
+        else if (!UseUsbToken && Regex.IsMatch(CertificateName, @"^[０-９]{4}"))
             throw new ArgumentException("証明書名の先頭年は半角数字で入力してください。");
         if (StartDate.Year >= 9998 || EndDate.Year >= 9998)
             throw new ArgumentException("次期の利用期間が設定可能な日付範囲を超えます。");
@@ -280,7 +288,8 @@ public static class SettingsValidation
         ArgumentNullException.ThrowIfNull(settings);
         ValidatePeriod(settings.StartDate, settings.EndDate);
         if (new[] { settings.CertificateName, settings.VaultUrl, settings.ClientId, settings.TenantId,
-            settings.ProtectedSecret, settings.ToolPath, settings.TimestampUrl, settings.PublisherName }.Any(value => value is null))
+            settings.ProtectedSecret, settings.ToolPath, settings.TimestampUrl, settings.PublisherName,
+            settings.SignToolPath, settings.UsbThumbprint, settings.UsbPublisherName }.Any(value => value is null))
             throw new InvalidDataException("設定項目にnullが含まれています。設定ファイルを確認してください。");
     }
 
@@ -309,6 +318,17 @@ public static class SettingsValidation
     public static void ValidateConnection(SigningSettings settings)
     {
         ValidateStructure(settings);
+        // 共通条件の後、選択中の署名方式だけを検査する。USBではAzureの認証情報を要求しない。
+        ValidateUrl(settings.TimestampUrl, false, "タイムスタンプURL");
+        if (settings.UseUsbToken)
+        {
+            if (string.IsNullOrWhiteSpace(settings.UsbPublisherName)) throw new ArgumentException("USB証明書の発行元名を入力してください。");
+            if (!Regex.IsMatch(UsbSigning.NormalizeThumbprint(settings.UsbThumbprint), @"\A[0-9A-F]{40}\z"))
+                throw new ArgumentException("USB証明書の拇印は40桁の16進数で指定してください。");
+            if (!Path.IsPathFullyQualified(settings.SignToolPath) || !Path.GetFileName(settings.SignToolPath).Equals("signtool.exe", StringComparison.OrdinalIgnoreCase))
+                throw new ArgumentException("Microsoft SignTool（signtool.exe）のフルパスを指定してください。");
+            return;
+        }
         if (string.IsNullOrWhiteSpace(settings.CertificateName) || string.IsNullOrWhiteSpace(settings.PublisherName))
             throw new ArgumentException("証明書名と自社証明書の発行元名を入力してください。");
         if (!Guid.TryParse(settings.ClientId, out var client) || client == Guid.Empty ||
