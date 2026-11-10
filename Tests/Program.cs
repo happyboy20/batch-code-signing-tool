@@ -3,6 +3,8 @@ using DigitalSigningTool;
 using System.Text.Json;
 using System.Text;
 using System.Diagnostics;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
 
 // 検証用の子プロセスもC#で実装し、スクリプトには依存しない。
 if (args.FirstOrDefault() == "--process-fixture")
@@ -160,6 +162,76 @@ try
     Check(commandFailure.Result == "失敗" && commandFailure.Detail.Contains("2") && !commandFailure.Detail.Contains("test-secret"), "nonzero signer exit fails without leaking secret");
     Check(File.ReadAllText(file) == "untouched", "all signing tests leave file contents untouched");
 
+    // USB分岐も実機・ストアへの書込・実署名なしで確認する。
+    var usb = new SigningSettings
+    {
+        UseUsbToken = true, SignToolPath = Path.Combine(root, "signtool.exe"),
+        UsbThumbprint = new string('A', 40), UsbPublisherName = "USB Example Publisher"
+    };
+    File.WriteAllText(usb.SignToolPath, "not executed");
+    SettingsValidation.ValidateConnection(usb);
+    Check(usb.IsConfigured && usb.ActiveToolPath == usb.SignToolPath && usb.ActivePublisherName == usb.UsbPublisherName, "USB does not require Azure settings or a secret");
+    var usbCopy = usb.Copy();
+    Check(usbCopy.UseUsbToken && usbCopy.UsbThumbprint == usb.UsbThumbprint && usbCopy.UsbPublisherName == usb.UsbPublisherName, "USB settings survive serialization");
+    Check(!JsonSerializer.Deserialize<SigningSettings>("{}")!.UseUsbToken, "legacy settings retain Azure mode");
+    Check(UsbSigning.NormalizeThumbprint("\u200e" + new string('a', 20) + " \n" + new string('a', 20)) == usb.UsbThumbprint, "copied thumbprint normalizes whitespace and direction markers");
+    var badUsb = usb.Copy(); badUsb.UsbThumbprint = new string('G', 40);
+    Reject(() => SettingsValidation.ValidateConnection(badUsb), "nonhex USB thumbprint rejected");
+    badUsb.UsbThumbprint = new string('A', 39);
+    Reject(() => SettingsValidation.ValidateConnection(badUsb), "short USB thumbprint rejected");
+    badUsb = usb.Copy(); badUsb.SignToolPath = Path.Combine(root, "other.exe");
+    Reject(() => SettingsValidation.ValidateConnection(badUsb), "USB requires explicit signtool.exe path");
+    badUsb = usb.Copy(); badUsb.UsbPublisherName = "";
+    Reject(() => SettingsValidation.ValidateConnection(badUsb), "USB publisher cannot be blank");
+    badUsb = usb.Copy(); badUsb.TimestampUrl = "https://user:password@example.com";
+    Reject(() => SettingsValidation.ValidateConnection(badUsb), "USB timestamp credentials rejected");
+    var spacedPath = Path.Combine(root, "対象 ' & [1].exe");
+    var usbArguments = SigningService.BuildSignerArguments(usb, "must-not-pass", spacedPath);
+    Check(usbArguments.Contains("/sha1") && usbArguments.Contains(usb.UsbThumbprint) && !usbArguments.Contains("/sm") && !usbArguments.Contains("must-not-pass") && usbArguments.Last() == spacedPath,
+        "USB current-user store uses exact thumbprint and isolated target argument without secrets");
+    usb.UsbLocalMachine = true;
+    Check(SigningService.BuildSignerArguments(usb, "", file).Contains("/sm"), "USB machine-store selection reaches SignTool");
+    var azureArguments = SigningService.BuildSignerArguments(Configured(), "azure-secret", file);
+    Check(azureArguments.Contains("-kvu") && azureArguments.Contains("azure-secret") && !azureArguments.Contains("/sha1"), "Azure signing arguments remain separate");
+    usb.CertificateName = "2026AzureKey"; usb.AdvanceYear();
+    Check(usb.CertificateName == "2026AzureKey", "USB period renewal leaves Azure certificate name unchanged");
+    using (var key = RSA.Create(2048))
+    {
+        var request = new CertificateRequest("CN=USB Example Publisher", key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        request.CertificateExtensions.Add(new X509EnhancedKeyUsageExtension(new OidCollection { new("1.3.6.1.5.5.7.3.3") }, true));
+        using var certificateFixture = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
+        Check(UsbSigning.IsSigningCertificate(certificateFixture, DateTime.Now), "in-memory valid code-signing certificate accepted");
+        Check(!UsbSigning.IsSigningCertificate(certificateFixture, DateTime.Now.AddDays(2)), "expired USB certificate rejected");
+        using var publicOnly = X509CertificateLoader.LoadCertificate(certificateFixture.Export(X509ContentType.Cert));
+        Check(!UsbSigning.IsSigningCertificate(publicOnly, DateTime.Now), "USB certificate without private-key association rejected");
+        var wrongUsage = new CertificateRequest("CN=Wrong Usage", key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+        using var wrongCertificate = wrongUsage.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
+        Check(!UsbSigning.IsSigningCertificate(wrongCertificate, DateTime.Now), "certificate without code-signing EKU rejected");
+        request.CertificateExtensions.Add(new X509KeyUsageExtension(X509KeyUsageFlags.KeyEncipherment, true));
+        using var wrongKeyUsage = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-1), DateTimeOffset.UtcNow.AddDays(1));
+        Check(!UsbSigning.IsSigningCertificate(wrongKeyUsage, DateTime.Now), "certificate without digital-signature key usage rejected");
+    }
+    var usbBefore = new SignatureInfo { Status = "NotSigned" };
+    var usbAfter = new SignatureInfo { Status = "Valid", HasCertificate = true, HasTimestamp = true, Publisher = usb.UsbPublisherName, Thumbprint = usb.UsbThumbprint };
+    int usbInspections = 0, usbSignCalls = 0;
+    Task<SignatureInfo> InspectUsb(string _) => Task.FromResult(++usbInspections == 1 ? usbBefore : usbAfter);
+    Task<(int, string)> SignUsb(SigningSettings _, string __, string ___) { usbSignCalls++; return Task.FromResult((0, "")); }
+    async Task<FileResult> RunUsb()
+    {
+        usbInspections = usbSignCalls = 0;
+        return await SigningService.SignCoreAsync(file, usb, "", InspectUsb, SignUsb, DateTime.Today);
+    }
+    Check((await RunUsb()).Result == "成功" && usbSignCalls == 1, "USB core succeeds without Azure secret");
+    usbAfter.Thumbprint = new string('B', 40);
+    Check((await RunUsb()).Result == "失敗", "USB post-check rejects wrong certificate even with same publisher");
+    usbAfter.Thumbprint = usb.UsbThumbprint; usbAfter.HasTimestamp = false;
+    Check((await RunUsb()).Result == "失敗", "USB requires timestamp after signing");
+    usbBefore = new() { Status = "Valid", HasCertificate = true, Publisher = "Other Publisher" };
+    Check((await RunUsb()).Result == "スキップ" && usbSignCalls == 0, "USB preserves another publisher's signature");
+    usbBefore = new() { Status = "UnknownError", HasCertificate = true };
+    Check((await RunUsb()).Result == "失敗" && usbSignCalls == 0, "USB preserves unknown existing signature");
+    Check(File.ReadAllText(file) == "untouched", "USB regression tests never modify the target");
+
     // プロセスの出力分離をC#の検証用子プロセスで確認する。
     var dotnet = Environment.GetEnvironmentVariable("DOTNET_HOST_PATH") ?? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ProgramFiles), "dotnet", "dotnet.exe");
     var self = System.Reflection.Assembly.GetExecutingAssembly().Location;
@@ -171,6 +243,7 @@ try
     Console.WriteLine($"Native signed file: {signedInfo.Status}; publisher={signedInfo.Publisher}; timestamp={signedInfo.HasTimestamp}");
     Check(signedInfo.HasCertificate && !string.IsNullOrWhiteSpace(signedInfo.Publisher), "native inspection reads signer from signed host");
     Check(signedInfo.Status == "Valid" && signedInfo.HasTimestamp, "native verification reads timestamp on valid signed file");
+    Check(signedInfo.Thumbprint.Length == 40, "native inspection supplies exact signer thumbprint");
     var damaged = Path.Combine(root, "署名検査'[] #.exe");
     File.Copy(dotnet, damaged);
     using (var changed = new FileStream(damaged, FileMode.Open, FileAccess.ReadWrite))
