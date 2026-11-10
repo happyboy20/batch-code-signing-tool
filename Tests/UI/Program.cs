@@ -83,6 +83,14 @@ internal static class UiChecks
         var install = (Button)setupForm.Controls.Find("InstallTool", true).Single();
         if (save.BackColor != start.BackColor || install.BackColor != start.BackColor || save.FlatStyle != start.FlatStyle) throw new Exception("Primary button style is not consistent");
         RenderForm(settingsForm, Path.Combine(root, "Settings-preview.png"));
+        using var usbForm = new SettingsForm(new SigningSettings { UseUsbToken = true });
+        var usbMode = (ComboBox)usbForm.Controls.Find("SigningMode", true).Single();
+        var usbPath = (TextBox)usbForm.Controls.Find("SignToolPath", true).Single();
+        if (usbMode.SelectedIndex != 1 || !usbMode.Text.Contains("USB") || !usbPath.Enabled) throw new Exception("USB mode did not restore");
+        usbMode.SelectedIndex = 0;
+        if (usbPath.Enabled) throw new Exception("USB inputs remain active in Azure mode");
+        usbMode.SelectedIndex = 1;
+        RenderForm(usbForm, Path.Combine(root, "USB-settings-preview.png"));
         RenderForm(setupForm, Path.Combine(root, "Setup-preview.png"));
         Console.WriteLine("PASS: five columns, checkbox binding, deduplication, same names, select/unselect all, button state, result symbols, selection count");
         Console.WriteLine("PASS: no manual-settings button; consistent window and primary-button styling on all three forms");
@@ -104,6 +112,11 @@ internal static class UiChecks
         using var content = form.Controls[0];
         form.Controls.Remove(content); content.Dock = DockStyle.None; content.Size = form.ClientSize;
         content.CreateControl(); content.PerformLayout();
+        if (FindControls(content).OfType<ComboBox>().Any(combo => combo.Name == "SigningMode"))
+        {
+            if (FindControls(content).OfType<DateTimePicker>().Any(picker => !picker.Visible || picker.Height == 0))
+                throw new Exception("Common period controls disappeared after mode switching");
+        }
         using var image = new Bitmap(content.Width, content.Height);
         content.DrawToBitmap(image, new Rectangle(Point.Empty, image.Size));
         image.Save(path);
